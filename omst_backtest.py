@@ -4,14 +4,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
 
-
+# ==========================================
 # 1. DATA ACQUISITION & PARAMETERS
-# Following Section 7.2: Target = NEM, Sector = GDX, Macro Driver = GLD
-target_ticker = "NEM"
-sector_ticker = "GDX"
-macro_ticker  = "GLD"
+# ==========================================
+# Testing the S&P 500 (SPY) Control Asset
+target_ticker = "SPY"
+sector_ticker = "XLK"  # Technology Sector ETF
+macro_ticker  = "SPY"
 
-start_date = "2023-01-01"
+# We use a longer history to accommodate the 252-day baseline
+start_date = "2022-01-01"
 end_date   = "2026-05-25"  # Current Date
 
 print("Downloading historical market data...")
@@ -34,10 +36,11 @@ df['sector_ret'] = np.log(df['sector_close'] / df['sector_close'].shift(1))
 df = df.dropna()
 
 # Parameters
-k = 20         # Fractal Periodicity window (roughly 1 trading month)
-W = 60         # Macro Normalization window (roughly 3 trading months)
-w1 = 0.5       # Weight for Smoothness
-w2 = 0.5       # Weight for Liquidity
+k = 20           # Fractal Periodicity window (roughly 1 trading month)
+W = 60           # Fluctuation Index (FIX) evaluation window
+baseline_W = 252 # --- THE COUPLING FIX --- 1 trading year baseline for Z-score normalization
+w1 = 0.5         # Weight for Smoothness
+w2 = 0.5         # Weight for Liquidity
 
 # Initialize output columns
 df['OMSE_raw'] = np.nan
@@ -46,25 +49,29 @@ df['C_t'] = np.nan
 df['PS_prior'] = np.nan
 df['OMSE_posterior'] = np.nan
 
-
+# ==========================================
 # 2. RUNNING THE OMST MATHEMATICAL BLENDER
+# ==========================================
 print("Running OMST engine...")
 
 # Step A: Pre-calculate Amihud Illiquidity (Eq 10)
-# Amihud Ratio = |Return| / Dollar Volume
 df['amihud'] = np.abs(df['target_ret']) / (df['target_vol'] * df['target_close'])
 
-# Step B: Main Loop for Fractal Lookbacks
-for t in range(max(k, W), len(df)):
+# Smooth Amihud over k-period to filter high-frequency noise
+df['amihud_smooth'] = df['amihud'].rolling(window=k).mean()
 
+# Step B: Main Loop for Fractal Lookbacks (Starts after baseline_W to allow Z-score calculation)
+for t in range(baseline_W, len(df)):
+
+    # --------------------------------------
     # Pillar 1: Directional Smoothness (Eq 1)
+    # --------------------------------------
     price_window = df['target_close'].iloc[t-k:t].values
-    # Normalize window to start at 1.0 for scale-invariance
     p_norm = price_window / price_window[0]
     
     # Calculate discrete arc length components
-    dx = 1.0 / k
     dy = np.diff(p_norm)
+    dx = 1.0 / len(dy)  # Standardizes total time step to 1.0
     
     actual_path = np.sum(np.sqrt(dx**2 + dy**2))
     straight_line = np.sqrt(1.0**2 + (p_norm[-1] - 1.0)**2)
@@ -72,89 +79,85 @@ for t in range(max(k, W), len(df)):
     # Smoothness ratio S_t
     S_t = straight_line / actual_path if actual_path > 0 else 0
     
-
+    # --------------------------------------
     # Pillar 2: Relative Liquidity (Eq 10)
-    # Z-score normalization of Amihud over window W
-    rolling_amihud = df['amihud'].iloc[t-W:t]
+    # --------------------------------------
+    # Z-score normalization of Amihud over the larger 252-day baseline_W
+    rolling_amihud = df['amihud_smooth'].iloc[t-baseline_W:t]
     mean_ami = rolling_amihud.mean()
     std_ami = rolling_amihud.std() if rolling_amihud.std() > 0 else 1e-8
     
-    Z_t = (df['amihud'].iloc[t] - mean_ami) / std_ami
+    Z_t = (df['amihud_smooth'].iloc[t] - mean_ami) / std_ami
     
-    # Map Z-score to [0,1] using Normal CDF. 
-    # High Z (high illiquidity) -> Low Liquidity L_t
+    # Map Z-score to [0,1] using Normal CDF.
     L_t = norm.cdf(-Z_t)
     
+    # --------------------------------------
     # Pillar 3: Blended Raw OMSE (Eq 2)
-    
+    # --------------------------------------
     OMSE_raw = (w1 * S_t + w2 * L_t)
     df.iloc[t, df.columns.get_loc('OMSE_raw')] = OMSE_raw
     
-    
+    # --------------------------------------
     # Pillar 4: Ecosystem Convergence (Eq 11)
-    
+    # --------------------------------------
     ret_target = df['target_ret'].iloc[t-W:t]
     ret_sector = df['sector_ret'].iloc[t-W:t]
     C_t = ret_target.corr(ret_sector)
     df.iloc[t, df.columns.get_loc('C_t')] = C_t
 
+# ==========================================
 # 3. BAYESIAN UPDATE & PREDISPOSITION STATE
-
-# Transition probabilities for the prior (Eq 5)
+# ==========================================
 p11 = 0.80  # Probability of remaining in Optimal State
 p01 = 0.15  # Probability of jumping to Optimal State
-
-# We initialize yesterday's posterior at 50%
 posterior_t_minus_1 = 0.50
 
-for t in range(max(k, W), len(df)):
+for t in range(baseline_W, len(df)):
     OMSE_raw = df['OMSE_raw'].iloc[t]
     if np.isnan(OMSE_raw):
         continue
         
-    # Calculate Predispositioned State Prior (Eq 5)
     PS_prior = p11 * posterior_t_minus_1 + p01 * (1.0 - posterior_t_minus_1)
     df.iloc[t, df.columns.get_loc('PS_prior')] = PS_prior
     
-    # Likelihood functions (Eq 6) modeled via normal distributions
-    # Optimal State favors high OMSE (mean=0.80); Chaotic favors low (mean=0.45)
     L_optimal = norm.pdf(OMSE_raw, loc=0.80, scale=0.15)
     L_chaotic = norm.pdf(OMSE_raw, loc=0.45, scale=0.25)
     
-    # Posterior calculation (Eq 6)
     numerator = L_optimal * PS_prior
     denominator = (L_optimal * PS_prior) + (L_chaotic * (1.0 - PS_prior))
     
     posterior_t = numerator / denominator if denominator > 0 else 0.5
     df.iloc[t, df.columns.get_loc('OMSE_posterior')] = posterior_t
-    
-    # Update state for next period
     posterior_t_minus_1 = posterior_t
 
+# ==========================================
 # 4. FLUCTUATION INDEX (FIX) (Eq 7 & 8)
-
+# ==========================================
 # Calculate FIX dynamically over a rolling window W
-for t in range(max(k, W) + W, len(df)):
-    rolling_posterior = df['OMSE_posterior'].iloc[t-W:t].dropna()
-    if len(rolling_posterior) < W:
+for t in range(baseline_W + W, len(df)):
+    rolling_omse = df['OMSE_raw'].iloc[t-W:t].dropna()
+    if len(rolling_omse) < W:
         continue
-        
-    mu_omse = rolling_posterior.mean()
-    sigma_omse = rolling_posterior.std()
     
-    q1 = rolling_posterior.quantile(0.25)
-    q3 = rolling_posterior.quantile(0.75)
+    # Scale decimal OMSE to percentage space (0 - 100)
+    rolling_omse_pct = rolling_omse * 100.0
+        
+    mu_omse = rolling_omse_pct.mean()
+    sigma_omse = rolling_omse_pct.std()
+    
+    q1 = rolling_omse_pct.quantile(0.25)
+    q3 = rolling_omse_pct.quantile(0.75)
     iqr_omse = q3 - q1
     
-    # Eq 7
     denom = sigma_omse * iqr_omse
     FIX_score = mu_omse / denom if denom > 0 else 0.0
     df.iloc[t, df.columns.get_loc('FIX')] = FIX_score
 
-# Drop initial empty rows for analysis
-df_clean = df.dropna().copy()
-
+# ==========================================
 # 5. VISUALIZATION & ANALYSIS
+# ==========================================
+df_clean = df.dropna(subset=['OMSE_posterior', 'FIX'])
 
 print("Generating analysis charts...")
 fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
