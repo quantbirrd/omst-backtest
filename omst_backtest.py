@@ -151,7 +151,7 @@ for t in range(baseline_W + W, len(df)):
     iqr_omse = q3 - q1
     
     denom = sigma_omse * iqr_omse
-    FIX_score = mu_omse / denom if denom > 0 else 0.0
+    FIX_score = mu_omse / (denom + 1e-8) if denom >= 0 else 0.0
     df.iloc[t, df.columns.get_loc('FIX')] = FIX_score
 
 # ==========================================
@@ -181,12 +181,17 @@ ax2.grid(True, linestyle="--", alpha=0.5)
 ax3.plot(df_clean.index, df_clean['FIX'], color='purple', label='Fluctuation Index (FIX)')
 ax3.axhline(10.0, color='green', linestyle='--', alpha=0.7, label='Sustained Stability Limit (FIX = 10.0)')
 ax3.axhline(1.0, color='red', linestyle='--', alpha=0.7, label='Chaos Boundary (FIX = 1.0)')
+ax3.set_ylim(-2, 25)
 ax3.set_ylabel("FIX Index Score")
 ax3.set_xlabel("Date")
 ax3.legend(loc='upper left')
 ax3.grid(True, linestyle="--", alpha=0.5)
 
 plt.tight_layout()
+
+# Save the plot as a high-resolution image for your LaTeX paper
+plt.savefig('omst_spy_backtest.png', dpi=300)
+
 plt.show()
 
 print("\n--- Backtest Summary ---")
